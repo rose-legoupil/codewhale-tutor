@@ -59,6 +59,12 @@ export default function App() {
     })
   }, [])
 
+  // Remember which world the chat tutor is anchored to, so it survives tab
+  // switches and reloads when more than one syllabus exists.
+  const chooseSyllabus = useCallback((id) => {
+    updatePrefs((p) => ({ ...p, activeSyllabusId: id }))
+  }, [updatePrefs])
+
   // Count today's visit toward the streak exactly once per mount.
   useEffect(() => {
     setPrefsState((prev) => {
@@ -136,7 +142,7 @@ export default function App() {
   function navigate(v, opts = {}) {
     if (v === 'world' && opts.syllabusId) {
       const s = syllabi.find((x) => x.id === opts.syllabusId)
-      if (s) { setSelectedSyllabus(s); setView('world') }
+      if (s) { setSelectedSyllabus(s); setView('world'); chooseSyllabus(s.id) }
       else { setSelectedSyllabus(null); setView('kingdom') }
     } else {
       setSelectedSyllabus(null)
@@ -144,7 +150,7 @@ export default function App() {
     }
     if (opts.prefill) setChatPrefill(opts.prefill)
   }
-  function enterWorld(s) { setSelectedSyllabus(s); setView('world') }
+  function enterWorld(s) { setSelectedSyllabus(s); setView('world'); chooseSyllabus(s.id) }
   function finishOnboarding(result) {
     updatePrefs({ ...prefs, onboarded: true, persona: { ...prefs.persona, ...result } })
   }
@@ -239,6 +245,8 @@ export default function App() {
                 prefs={prefs} setPrefs={updatePrefs} persona={persona}
                 loading={loading} onNavigate={navigate}
                 chatPrefill={chatPrefill} onConsumePrefill={() => setChatPrefill(null)}
+                activeSyllabusId={prefs.activeSyllabusId || null}
+                onChooseSyllabus={chooseSyllabus}
               />
             )}
             {!loading && view === 'gauntlet' && <Gauntlet exams={exams} syllabi={syllabi} />}

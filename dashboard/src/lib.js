@@ -364,13 +364,20 @@ function greetText(ctx) {
   return `${base}\n\nI've spotted ${syllabi.length} world(s) to explore and ${p.length} progress log(s). Ask me for your quests, weaknesses, a quiz, or a review — or just tell me what you want to learn.`
 }
 
+function defaultWorld(ctx) {
+  // The active world wins; otherwise prefer a syllabus that already has
+  // content over an empty, just-created container.
+  const arr = ctx.syllabi || []
+  return ctx.active || arr.find((s) => (s.concepts || 0) > 0) || arr[0] || null
+}
+
 function socraticText(ctx) {
   const weak = weakestConcepts(ctx.progress, 1)[0]
   if (weak) {
     return `${openers(ctx)}\n\nI noticed "${weak.concept}" is at ${pct(weak.mastery)}. Let me ask you this: what do you already understand about it, and where exactly does it get foggy? Explain it back to me like I'm a curious dolphin. 🐬`
   }
-  if ((ctx.syllabi || []).length) {
-    const first = ctx.syllabi[0]
+  const first = defaultWorld(ctx)
+  if (first) {
     return `${openers(ctx)}\n\nWe have a whole world to explore. Which concept would you like to tackle, or shall I suggest the first quest in "${first.name}"?`
   }
   return `${openers(ctx)}\n\nI need a syllabus before I can truly tutor you. Drop one into ~/.codewhale/syllabi and press Sync. Then ask me anything.`
@@ -396,7 +403,7 @@ export function coachReply(raw, ctx) {
 
 export function generateQuests(ctx) {
   const quests = []
-  const first = (ctx.syllabi && ctx.syllabi[0]) || null
+  const first = defaultWorld(ctx)
   const weak = weakestConcepts(ctx.progress, 1)[0]
   const unmastered = weakestConcepts(ctx.progress, 10)
   const mocks = (ctx.exams || []).filter((e) => e.kind === 'mock')

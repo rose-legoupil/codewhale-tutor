@@ -795,15 +795,19 @@ def _save_registry(registry: Dict) -> None:
 
 
 def _scan(dir_path: Path, kind: str) -> List[Dict]:
-    results = []
-    if not dir_path.exists():
-        return results
-    for p in sorted(dir_path.iterdir()):
-        if not p.is_file() or p.name.startswith("."):
-            continue
-        if p.suffix.lower() not in SOURCE_EXTENSIONS:
-            continue
-        results.append({
+    """List raw source documents, recursing one level into per-syllabus containers.
+
+    ``syllabi/`` and ``exams/`` accept both loose documents (flat, as before)
+    and sub-folders named after a syllabus id:
+
+      * ``syllabi/<id>/…``  → that syllabus's course content
+      * ``exams/<id>/…``    → exams *linked* to that syllabus
+
+    Files inside a container get ``syllabus_id`` set, so they are attached to
+    their syllabus deterministically (no front matter / auto-match needed).
+    """
+    def _entry(p: Path, container: Optional[str]) -> Dict:
+        return {
             "path": p,
             "rel": str(p.relative_to(CW_HOME)),
             "name": p.name,
@@ -812,12 +816,85 @@ def _scan(dir_path: Path, kind: str) -> List[Dict]:
             "kind": kind,
             "fp": fingerprint(p),
             "mtime": int(p.stat().st_mtime),
-        })
+            "container": container,
+            "syllabus_id": container,
+        }
+
+    results = []
+    if not dir_path.exists():
+        return results
+    for p in sorted(dir_path.iterdir()):
+        if p.name.startswith("."):
+            continue
+        if p.is_dir():
+            container = _slugify(p.name) or None
+            for f in sorted(p.iterdir()):
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                if f.suffix.lower() not in SOURCE_EXTENSIONS:
+                    continue
+                results.append(_entry(f, container))
+            continue
+        if p.suffix.lower() not in SOURCE_EXTENSIONS:
+            continue
+        results.append(_entry(p, None))
     return results
 
 
-def _build_syllabi(sources: List[Dict]) -> Dict[str, Dict]:
+def _container_metas() -> Dict[str, Dict]:
+    """Load created-syllabus metadata from ``syllabi/<id>/project.json``.
+
+    A syllabus can be created in the interface *before* any document is
+    uploaded; the empty container still needs a registry entry so it shows up
+    in the dashboard and receives its first documents.
+    """
+    out: Dict[str, Dict] = {}
+    if not SYLLABI_DIR.exists():
+        return out
+    for p in sorted(SYLLABI_DIR.iterdir()):
+        if not p.is_dir():
+            continue
+        meta_file = p / "project.json"
+        if not meta_file.exists():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        sid = _slugify(meta.get("id") or p.name) or None
+        if not sid:
+            continue
+        out[sid] = {
+            "name": meta.get("name") or p.name,
+            "language": meta.get("language") or "auto",
+            "discipline": meta.get("discipline") or "",
+        }
+    return out
+
+
+def _build_syllabi(sources: List[Dict], container_meta: Optional[Dict[str, Dict]] = None) -> Dict[str, Dict]:
+    container_meta = container_meta or {}
     grouped: Dict[str, Dict] = {}
+
+    def new_entry(sid: str, name: str, language: str = "auto", discipline: str = "") -> Dict:
+        entry = {
+            "id": sid,
+            "name": name,
+            "language": language or "auto",
+            "concepts": [],
+            "learning_objectives": [],
+            "sources": [],
+        }
+        if discipline:
+            entry["discipline"] = discipline
+        return entry
+
+    # Seed one entry per created syllabus container so syllabi created in the
+    # interface show up even before their first document is uploaded.
+    for sid, cm in container_meta.items():
+        grouped[sid] = new_entry(sid, cm.get("name") or sid,
+                                 cm.get("language") or "auto", cm.get("discipline") or "")
+
     for src in sources:
         try:
             text = _read_text(src["path"])
@@ -831,7 +908,9 @@ def _build_syllabi(sources: List[Dict]) -> Dict[str, Dict]:
         multi = len(blocks) > 1
         for k, block in enumerate(blocks, 1):
             meta = block.get("meta", {})
-            if meta.get("id"):
+            if src.get("syllabus_id"):
+                sid = src["syllabus_id"]  # inside syllabi/<id>/ container
+            elif meta.get("id"):
                 sid = _slugify(meta["id"])
             elif multi:
                 sid = f"{_slugify(src['stem'])}-{k}"
@@ -839,20 +918,29 @@ def _build_syllabi(sources: List[Dict]) -> Dict[str, Dict]:
                 sid = _slugify(src["stem"])
 
             concepts, objectives = parse_source(block.get("body", ""), src["suffix"])
-            entry = grouped.setdefault(sid, {
-                "id": sid,
-                "name": meta.get("name") or src["stem"],
-                "language": meta.get("language") or "auto",
-                "concepts": [],
-                "learning_objectives": [],
-                "sources": [],
-            })
-            if meta.get("name"):
-                entry["name"] = meta["name"]
-            if meta.get("discipline"):
+            seeded = sid in container_meta
+            if sid not in grouped:
+                grouped[sid] = new_entry(
+                    sid,
+                    (container_meta.get(sid) or {}).get("name")
+                    or (sid if src.get("container") else meta.get("name") or src["stem"]),
+                    (container_meta.get(sid) or {}).get("language")
+                    or meta.get("language") or "auto",
+                    (container_meta.get(sid) or {}).get("discipline")
+                    or meta.get("discipline") or "",
+                )
+            entry = grouped[sid]
+            # A container's project.json metadata wins over per-file headers so
+            # the syllabus keeps the name/language chosen when it was created.
+            if not seeded:
+                if meta.get("name"):
+                    entry["name"] = meta["name"]
+                if meta.get("language"):
+                    entry["language"] = meta["language"]
+                if meta.get("source_status"):
+                    entry["source_status"] = meta["source_status"]
+            if meta.get("discipline") and "discipline" not in entry:
                 entry["discipline"] = meta["discipline"]
-            if meta.get("source_status"):
-                entry["source_status"] = meta["source_status"]
             entry["concepts"].extend(concepts)
             entry["learning_objectives"].extend(objectives)
             entry["sources"].append({
@@ -874,7 +962,8 @@ def _build_syllabi(sources: List[Dict]) -> Dict[str, Dict]:
         s["learning_objectives"] = list(dict.fromkeys(s["learning_objectives"]))
         if s["language"] == "auto":
             sample = " ".join(c["name"] for c in s["concepts"])
-            s["language"] = _detect_language(sample)
+            if sample:  # an empty container keeps "auto" until its first upload
+                s["language"] = _detect_language(sample)
 
         # Materialise the learning path + module grouping.
         ordered = s["concepts"]
@@ -929,6 +1018,10 @@ def _build_real_exams(sources: List[Dict], syllabi: Dict[str, Dict]) -> List[Dic
             body = block.get("body", "")
             if meta.get("id"):
                 exam_id = _slugify(meta["id"])
+            elif src.get("container"):
+                # Inside exams/<id>/ no front matter is needed; namespace the
+                # exam id with its syllabus to avoid collisions.
+                exam_id = f"{src['container']}-{_slugify(src['stem'])}"
             elif len(blocks) > 1:
                 exam_id = f"{_slugify(src['stem'])}-{k}"
             else:
@@ -937,8 +1030,9 @@ def _build_real_exams(sources: List[Dict], syllabi: Dict[str, Dict]) -> List[Dic
             questions = parse_exam_questions(body)
             concepts_tested = list(dict.fromkeys(q["concept"] for q in questions))
 
-            # Link to a syllabus: explicit front matter wins, else category/word overlap.
-            syllabus_id = meta.get("syllabus_id") or ""
+            # Link to a syllabus: the exams/<id>/ container wins, then explicit
+            # front matter, then category/word overlap.
+            syllabus_id = src.get("syllabus_id") or meta.get("syllabus_id") or ""
             if not syllabus_id:
                 scores: Dict[str, int] = {}
                 for q in questions:
@@ -1136,7 +1230,7 @@ def sync_library() -> Dict:
     syllabus_sources = _scan(SYLLABI_DIR, "syllabus")
     exam_sources = _scan(EXAMS_DIR, "exam")
 
-    syllabi = _build_syllabi(syllabus_sources)
+    syllabi = _build_syllabi(syllabus_sources, _container_metas())
     real_exams = _build_real_exams(exam_sources, syllabi)
     _apply_exam_frequency(syllabi, real_exams)
 
@@ -1147,7 +1241,7 @@ def sync_library() -> Dict:
     for sid, s in syllabi.items():
         s["completeness"] = validate_syllabus(s, has_exams=bool(exam_ids_by_syllabus.get(sid)))
 
-    mock_exams = [build_mock_exam(s) for s in syllabi.values()]
+    mock_exams = [build_mock_exam(s) for s in syllabi.values() if s.get("concepts")]
 
     # Persist organised syllabi.
     for sid, s in syllabi.items():
@@ -1170,15 +1264,29 @@ def sync_library() -> Dict:
     # Registry index + source fingerprints for change detection / cleanup.
     current_sources: Dict[str, Dict] = {}
     for src in syllabus_sources:
-        # Best-effort: record which syllabus this source contributed to.
-        sid = _slugify(src["stem"])
-        blocks = split_blocks(_read_text(src["path"]) if src["suffix"] != ".pdf" else "")
-        if len(blocks) == 1 and blocks[0].get("meta", {}).get("id"):
-            sid = _slugify(blocks[0]["meta"]["id"])
+        if src.get("syllabus_id"):
+            # Inside a syllabi/<id>/ container the folder decides the syllabus.
+            sid = src["syllabus_id"]
+        else:
+            # Best-effort: record which syllabus this source contributed to.
+            sid = _slugify(src["stem"])
+            blocks = split_blocks(_read_text(src["path"]) if src["suffix"] != ".pdf" else "")
+            if len(blocks) == 1 and blocks[0].get("meta", {}).get("id"):
+                sid = _slugify(blocks[0]["meta"]["id"])
         current_sources[src["rel"]] = {"kind": "syllabus", "syllabus_id": sid,
                                        "sha256": src["fp"], "mtime": src["mtime"]}
     for src in exam_sources:
-        current_sources[src["rel"]] = {"kind": "exam", "exam_id": _slugify(src["stem"]),
+        exam_id = None
+        try:
+            blocks = split_blocks(_read_text(src["path"]) if src["suffix"] != ".pdf" else "")
+            if blocks and blocks[0].get("meta", {}).get("id"):
+                exam_id = _slugify(blocks[0]["meta"]["id"])
+        except Exception:  # noqa: BLE001
+            pass
+        if not exam_id:
+            exam_id = (f"{src['container']}-{_slugify(src['stem'])}" if src.get("container")
+                       else _slugify(src["stem"]))
+        current_sources[src["rel"]] = {"kind": "exam", "exam_id": exam_id,
                                        "sha256": src["fp"], "mtime": src["mtime"]}
 
     _cleanup_stale(prev.get("sources", {}), current_sources, syllabi, real_exams)

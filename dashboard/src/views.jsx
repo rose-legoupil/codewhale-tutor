@@ -103,6 +103,7 @@ export function Kingdom({ syllabi, details, progress, exams, summary, streak, xp
             {!syllabi.length ? (
               <EmptyState emoji="🏝️" title={t('kingdom.noWorlds.title')}>
                 <p className="muted">{t('kingdom.noWorlds.body')}</p>
+                <button className="btn" onClick={() => onNavigate('settings')}>{t('kingdom.createFirst')}</button>
               </EmptyState>
             ) : (
               <div className="world-grid">
@@ -320,7 +321,7 @@ export function CheatsheetCard({ syllabusId, name }) {
 
 // ---------------------------------------------------------------- Quest (the chat / agent home)
 
-export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, loading, onNavigate, chatPrefill, onConsumePrefill }) {
+export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, loading, onNavigate, chatPrefill, onConsumePrefill, activeSyllabusId, onChooseSyllabus }) {
   const [input, setInput] = useState('')
   const [typing, setTyping] = useState(false)
   const endRef = useRef(null)
@@ -329,22 +330,45 @@ export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, load
   const { t, locale } = useI18n()
   const messages = prefs.chat || []
 
+  // The world this tutoring chat is anchored to. An explicit choice wins, then
+  // the first syllabus that has progress, then the first syllabus (so the chat
+  // works the same as before when there is only one world).
+  const active = useMemo(() => {
+    if (activeSyllabusId) {
+      const s = syllabi.find((x) => x.id === activeSyllabusId)
+      if (s) return s
+    }
+    const p = (progress || [])[0]
+    if (p && p.syllabus_id) {
+      const s = syllabi.find((x) => x.id === p.syllabus_id)
+      if (s) return s
+    }
+    return syllabi.find((s) => (s.concepts || 0) > 0) || syllabi[0] || null
+  }, [activeSyllabusId, syllabi, progress])
+  const targetId = active ? active.id : null
+
+  function chooseWorld(s) {
+    if (!s || s.id === targetId) return
+    if (onChooseSyllabus) onChooseSyllabus(s.id)
+    pushAssistant(t('quest.worldChanged', { name: s.name }))
+  }
+
   useEffect(() => {
     if (seededRef.current) return
     if (loading) return
     if (messages.length) { seededRef.current = true; return }
     seededRef.current = true
-    const target = (progress[0] && progress[0].syllabus_id) || (syllabi[0] && syllabi[0].id) || null
-    postJSON(`${API}/chat`, { message: '', locale, persona, syllabus_id: target })
+    postJSON(`${API}/chat`, { message: '', locale, persona, syllabus_id: targetId })
       .then((res) => {
-        const text = (res && res.reply) || coachReply('', { persona, syllabi, progress, exams })
+        const text = (res && res.reply) || coachReply('', { persona, syllabi, progress, exams, active })
         setPrefs((prev) => ({ ...prev, chat: [...(prev.chat || []), { role: 'whaley', text, ts: Date.now() }] }))
       })
       .catch(() => {
-        const text = coachReply('', { persona, syllabi, progress, exams })
+        const text = coachReply('', { persona, syllabi, progress, exams, active })
         setPrefs((prev) => ({ ...prev, chat: [...(prev.chat || []), { role: 'whaley', text, ts: Date.now() }] }))
       })
-  }, [loading, messages.length, persona, syllabi, progress, exams, locale])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, messages.length, persona, syllabi, progress, exams, locale, targetId])
 
   useEffect(() => {
     endRef.current && endRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
@@ -367,23 +391,28 @@ export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, load
     setInput('')
     setPrefs((prev) => ({ ...prev, chat: [...(prev.chat || []), { role: 'user', text: raw, ts: Date.now() }] }))
     setTyping(true)
-    const target = (progress[0] && progress[0].syllabus_id) || (syllabi[0] && syllabi[0].id) || null
     let reply = null
     try {
-      const res = await postJSON(`${API}/chat`, { message: raw, locale, persona, syllabus_id: target })
+      const res = await postJSON(`${API}/chat`, { message: raw, locale, persona, syllabus_id: targetId })
       if (res && res.reply) reply = res.reply
     } catch { /* fall back to local coach */ }
     setTimeout(() => {
-      pushAssistant(reply || coachReply(raw, { persona, syllabi, progress, exams }))
+      pushAssistant(reply || coachReply(raw, { persona, syllabi, progress, exams, active }))
       setTyping(false)
     }, 450)
   }
 
   async function quizMe() {
     if (typing) return
-    const candidates = (exams || []).filter((e) => (e.questions || 0) > 0)
+    // Prefer exams from the world being tutored; fall back to all exams only
+    // when the learner has not anchored the chat to a world.
+    let candidates = active
+      ? (exams || []).filter((e) => e.syllabus_id === active.id && (e.questions || 0) > 0)
+      : (exams || []).filter((e) => (e.questions || 0) > 0)
     if (!candidates.length) {
-      pushAssistant('I need at least one exam or mock exam before I can quiz you. Press Sync after adding a syllabus. 🎲')
+      pushAssistant(active
+        ? `No exam or mock battle is ready in "${active.name}" yet — add an exam or press Sync, then I will quiz you. 🎲`
+        : 'I need at least one exam or mock exam before I can quiz you. Press Sync after adding a syllabus. 🎲')
       return
     }
     const exam = candidates[Math.floor(Math.random() * candidates.length)]
@@ -404,16 +433,15 @@ export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, load
 
   async function nextStep() {
     if (typing) return
-    const target = (progress[0] && progress[0].syllabus_id) || (syllabi[0] && syllabi[0].id)
-    if (!target) {
+    if (!targetId) {
       pushAssistant('Add a syllabus and press Sync first — then I can recommend a next step. 🐋')
       return
     }
     setTyping(true)
     let text = 'I need a syllabus model to recommend a next step. Press Sync if you just added one.'
     try {
-      const na = await getJSON(`${API}/policy/next/${target}`)
-      text = `🎯 Recommended next step:\n\n${na.label}\nTarget: ${na.title}\n${na.reason}\n\nSuggested task types: ${(na.suggested_task_types || []).join(', ') || '—'} · support: ${na.support_level}`
+      const na = await getJSON(`${API}/policy/next/${targetId}`)
+      text = `🎯 Recommended next step${active ? ` in "${active.name}"` : ''}:\n\n${na.label}\nTarget: ${na.title}\n${na.reason}\n\nSuggested task types: ${(na.suggested_task_types || []).join(', ') || '—'} · support: ${na.support_level}`
     } catch { /* fall back to text above */ }
     setTimeout(() => {
       pushAssistant(text)
@@ -451,6 +479,22 @@ export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, load
               <p className="muted">{t('quest.sub')}</p>
             </div>
           </div>
+
+          {syllabi.length > 1 && (
+            <div className="quest-worlds">
+              <span className="quest-worlds-label">{t('quest.world')}</span>
+              {syllabi.map((s) => (
+                <button
+                  key={s.id}
+                  className={`chip ${active && active.id === s.id ? 'chip-active' : ''}`}
+                  onClick={() => chooseWorld(s)}
+                  title={s.name}
+                >
+                  {syllabusEmoji(s)} {s.name}
+                </button>
+              ))}
+            </div>
+          )}
 
           <div className="mood-strip">
             <span className="muted">{t('quest.mood')}</span>
@@ -511,7 +555,7 @@ export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, load
 
         <aside className="quest-side">
           <Section emoji="📜" title={t('quest.quests')}>
-            <QuestList syllabi={syllabi} progress={progress} exams={exams} onNavigate={onNavigate} />
+            <QuestList syllabi={syllabi} progress={progress} exams={exams} onNavigate={onNavigate} active={active} />
           </Section>
           <Section emoji="🧠" title={t('quest.about')}>
             <p className="muted">{t('quest.aboutBody')}</p>
@@ -522,9 +566,9 @@ export function Quest({ syllabi, progress, exams, prefs, setPrefs, persona, load
   )
 }
 
-function QuestList({ syllabi, progress, exams, onNavigate }) {
+function QuestList({ syllabi, progress, exams, onNavigate, active }) {
   const { t } = useI18n()
-  const quests = useMemo(() => generateQuests({ syllabi, progress, exams }), [syllabi, progress, exams])
+  const quests = useMemo(() => generateQuests({ syllabi, progress, exams, active }), [syllabi, progress, exams, active])
   if (!quests.length) {
     return <p className="muted">{t('settings.empty')}</p>
   }
@@ -1009,14 +1053,24 @@ export function Settings({ syllabi, onChanged }) {
   const [tab, setTab] = useState('syllabi')
   const [sources, setSources] = useState([])
   const [uploading, setUploading] = useState(false)
-  const [uploadKind, setUploadKind] = useState('syllabus')
   const [status, setStatus] = useState('')
+  const [showNew, setShowNew] = useState(false)
+  const [newName, setNewName] = useState('')
+  const [newLanguage, setNewLanguage] = useState('auto')
+  const [targetId, setTargetId] = useState(null)
 
   const [selectedId, setSelectedId] = useState((syllabi[0] && syllabi[0].id) || null)
   const [modelJson, setModelJson] = useState('')
   const [modelSaved, setModelSaved] = useState(false)
 
   const [llm, setLlm] = useState(null)
+
+  // The syllabus documents are uploaded into. Prefer the explicit choice, then
+  // a syllabus that already has content, then the first one.
+  const target = syllabi.find((s) => s.id === targetId)
+    || syllabi.find((s) => (s.concepts || 0) > 0)
+    || syllabi[0]
+    || null
 
   async function loadSources() {
     try { setSources(await getJSON(`${API}/sources`)) } catch { setSources([]) }
@@ -1028,20 +1082,30 @@ export function Settings({ syllabi, onChanged }) {
   useEffect(() => { loadSources() }, [])
   useEffect(() => { loadLlm() }, [])
 
-  async function onUpload(file) {
-    if (!file) return
+  async function readAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result).split(',')[1] || '')
+      r.onerror = reject
+      r.readAsDataURL(file)
+    })
+  }
+
+  async function uploadInto(fileList, kind) {
+    const files = Array.from(fileList || []).filter(Boolean)
+    if (!files.length) return
+    if (!target) {
+      setStatus(`⚠️ ${t('settings.target.none')}`)
+      return
+    }
     setUploading(true)
     setStatus('')
     try {
-      const dataUrl = await new Promise((resolve, reject) => {
-        const r = new FileReader()
-        r.onload = () => resolve(r.result)
-        r.onerror = reject
-        r.readAsDataURL(file)
-      })
-      const base64 = String(dataUrl).split(',')[1] || ''
-      await postJSON(`${API}/upload`, { filename: file.name, kind: uploadKind, data: base64, encoding: 'base64' })
-      setStatus(`✓ ${file.name}`)
+      for (const file of files) {
+        const base64 = await readAsBase64(file)
+        await postJSON(`${API}/upload`, { filename: file.name, kind, syllabus_id: target.id, data: base64, encoding: 'base64' })
+      }
+      setStatus(`✓ ${files.length} ${files.length === 1 ? 'file' : 'files'} → ${target.name}`)
       await Promise.all([loadSources(), onChanged && onChanged()])
     } catch (e) {
       setStatus(`⚠️ ${e.message}`)
@@ -1050,11 +1114,32 @@ export function Settings({ syllabi, onChanged }) {
     }
   }
 
+  async function createSyllabus(e) {
+    e.preventDefault()
+    const name = newName.trim()
+    if (!name) {
+      setStatus(`⚠️ ${t('settings.create.name')}`)
+      return
+    }
+    setStatus('')
+    try {
+      const res = await postJSON(`${API}/syllabi`, { name, language: newLanguage })
+      setNewName('')
+      setShowNew(false)
+      setTargetId(res.id)
+      setStatus(`✓ ${t('settings.created', { name: res.name })}`)
+      await Promise.all([loadSources(), onChanged && onChanged()])
+    } catch (err) {
+      setStatus(`⚠️ ${err.message}`)
+    }
+  }
+
   async function onDelete(id) {
     if (!window.confirm(t('settings.delete.confirm'))) return
     setStatus('')
     try {
       await delJSON(`${API}/syllabi/${id}`)
+      if (targetId === id) setTargetId(null)
       setStatus('✓')
       await Promise.all([loadSources(), onChanged && onChanged()])
     } catch (e) {
@@ -1135,49 +1220,102 @@ export function Settings({ syllabi, onChanged }) {
       </div>
 
       {tab === 'syllabi' && (
-        <div className="col-main">
-          <Section emoji="📥" title={t('settings.upload')}>
-            <div className="upload-row">
-              <select value={uploadKind} onChange={(e) => setUploadKind(e.target.value)}>
-                <option value="syllabus">{t('settings.upload.kind.syllabus')}</option>
-                <option value="exam">{t('settings.upload.kind.exam')}</option>
-              </select>
-              <input type="file" accept=".md,.txt,.markdown,.text,.rst,.pdf" onChange={(e) => onUpload(e.target.files && e.target.files[0])} />
-              {uploading && <span className="muted">…</span>}
-            </div>
-            <p className="muted">{t('settings.upload.hint')}</p>
-          </Section>
-
-          <Section emoji="🗂" title={t('settings.syllabi')}>
-            {!syllabi.length ? (
-              <p className="muted">{t('settings.empty')}</p>
-            ) : (
+        <div className="two-col settings-flow">
+          <div className="col-side">
+            <Section emoji="🏰" title={t('settings.flow.choose')}>
+              <p className="muted">{t('settings.flow.chooseHint')}</p>
+              {!syllabi.length && (
+                <p className="muted">{t('settings.noSyllabusYet')}</p>
+              )}
               <div className="exam-list">
-                {syllabi.map((s) => (
-                  <div className="exam-item" key={s.id}>
-                    <span className="exam-emoji">{syllabusEmoji(s)}</span>
-                    <div className="exam-body">
-                      <div className="exam-name">{s.name}</div>
-                      <div className="muted">{t('common.concepts', { n: s.concepts })} · {s.competences ?? 0} comp</div>
+                {syllabi.map((s) => {
+                  const isTarget = target && target.id === s.id
+                  return (
+                    <div key={s.id} className={`exam-item ${isTarget ? 'active' : ''}`}>
+                      <span className="exam-emoji">{syllabusEmoji(s)}</span>
+                      <div className="exam-body">
+                        <div className="exam-name">{s.name}</div>
+                        <div className="muted">
+                          {s.concepts ? t('common.concepts', { n: s.concepts }) : t('settings.emptyWorld')}
+                          {(s.language && s.language !== 'auto') ? ` · ${s.language}` : ''}
+                        </div>
+                      </div>
+                      <button className="btn small" onClick={() => setTargetId(s.id)} disabled={isTarget}>
+                        {isTarget ? '✓' : t('settings.use')}
+                      </button>
+                      <button className="btn small ghost danger" onClick={() => onDelete(s.id)} title={t('settings.delete')}>✕</button>
                     </div>
-                    <button className="btn small ghost danger" onClick={() => onDelete(s.id)}>{t('settings.delete')}</button>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
-            )}
-          </Section>
 
-          <Section emoji="📁" title={t('settings.sources')}>
-            {!sources.length ? (
-              <p className="muted">{t('settings.empty')}</p>
+              {!showNew ? (
+                <button className="btn" onClick={() => setShowNew(true)}>{t('settings.create')}</button>
+              ) : (
+                <form className="new-syllabus" onSubmit={createSyllabus}>
+                  <input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={t('settings.create.name')} />
+                  <select value={newLanguage} onChange={(e) => setNewLanguage(e.target.value)}>
+                    <option value="auto">{t('settings.create.languageAuto')}</option>
+                    <option value="English">English</option>
+                    <option value="French">Français</option>
+                    <option value="Spanish">Español</option>
+                    <option value="German">Deutsch</option>
+                  </select>
+                  <div className="row-actions">
+                    <button type="submit" className="btn primary" disabled={!newName.trim()}>{t('settings.create.btn')}</button>
+                    <button type="button" className="btn ghost" onClick={() => { setShowNew(false); setNewName('') }}>{t('settings.create.cancel')}</button>
+                  </div>
+                </form>
+              )}
+            </Section>
+          </div>
+
+          <div className="col-main">
+            {!target ? (
+              <Section emoji="📥" title={t('settings.flow.upload')}>
+                <p className="muted">{t('settings.target.none')}</p>
+              </Section>
             ) : (
-              <ul className="simple-list">
-                {sources.map((src, i) => (
-                  <li key={i}>{src.kind === 'exam' ? '📄' : '📚'} {src.rel} <span className="muted">({Math.round(src.size / 1024)} KB)</span></li>
-                ))}
-              </ul>
+              <>
+                <Section emoji="📥" title={t('settings.flow.uploadFor', { name: target.name })}>
+                  <p className="muted">{t('settings.flow.uploadHint')}</p>
+                  <div className="upload-row">
+                    <label className="btn file-btn">
+                      {t('settings.drop.syllabus')}
+                      <input type="file" accept=".md,.txt,.markdown,.text,.rst,.pdf" multiple hidden
+                        onChange={(e) => uploadInto(e.target.files, 'syllabus')} />
+                    </label>
+                    <span className="muted">{t('settings.drop.syllabusDesc')}</span>
+                  </div>
+                  <div className="upload-row">
+                    <label className="btn file-btn">
+                      {t('settings.drop.exam')}
+                      <input type="file" accept=".md,.txt,.markdown,.text,.rst,.pdf" multiple hidden
+                        onChange={(e) => uploadInto(e.target.files, 'exam')} />
+                    </label>
+                    <span className="muted">{t('settings.drop.examDesc')}</span>
+                  </div>
+                  {uploading && <p className="muted">…</p>}
+                </Section>
+
+                <Section emoji="📁" title={t('settings.sourcesFor', { name: target.name })}>
+                  {(() => {
+                    const docs = sources.filter((src) => src.syllabus_id === target.id)
+                    if (!docs.length) return <p className="muted">{t('settings.sourcesEmpty')}</p>
+                    return (
+                      <ul className="simple-list">
+                        {docs.map((src, i) => (
+                          <li key={i}>{src.kind === 'exam' ? '📄' : '📚'}{' '}
+                            {src.rel} <span className="muted">({Math.round(src.size / 1024)} KB)</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )
+                  })()}
+                </Section>
+              </>
             )}
-          </Section>
+          </div>
         </div>
       )}
 

@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -126,9 +127,63 @@ class AnalyticsSummary(BaseModel):
 
 @app.get("/api/syllabi")
 async def get_syllabi():
-    """List organised syllabi from the library registry."""
+    """List organised syllabi from the library registry.
+
+    Created-but-empty syllabi (no documents uploaded yet) are included so the
+    interface can offer them as upload targets.
+    """
     reg = library.load_registry()
     return list(reg.get("syllabi", {}).values())
+
+
+class NewSyllabusRequest(BaseModel):
+    name: str
+    language: str = "auto"
+    discipline: Optional[str] = None
+
+
+@app.post("/api/syllabi")
+async def create_syllabus(req: NewSyllabusRequest):
+    """Create a syllabus *before* its documents exist.
+
+    Creates a ``syllabi/<id>/`` container (plus an ``exams/<id>/`` folder for
+    its future linked exams) so the workflow is: create/choose a syllabus,
+    then upload its documents into it.
+    """
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Syllabus name is required")
+
+    reg = library.load_registry()
+    for s in reg.get("syllabi", {}).values():
+        if str(s.get("name", "")).strip().lower() == name.lower():
+            raise HTTPException(status_code=409,
+                                detail=f"A syllabus named “{s.get('name')}” already exists")
+
+    slug = library._slugify(name) or "syllabus"
+    taken = set(reg.get("syllabi", {}).keys())
+    base, i = slug, 2
+    while slug in taken or (SYLLABI_DIR / slug).exists():
+        slug = f"{base}-{i}"
+        i += 1
+
+    sdir = SYLLABI_DIR / slug
+    sdir.mkdir(parents=True, exist_ok=True)
+    (EXAMS_DIR / slug).mkdir(parents=True, exist_ok=True)
+    meta = {
+        "id": slug,
+        "name": name,
+        "language": req.language or "auto",
+        "discipline": req.discipline or None,
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    (sdir / "project.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    summary = await asyncio.to_thread(library.sync_library)
+    return {"id": slug, "name": name, "language": meta["language"],
+            "discipline": meta["discipline"], "created": meta["created"],
+            "summary": summary}
 
 
 @app.get("/api/syllabi/{syllabus_id}")
@@ -732,6 +787,7 @@ async def activity(req: ChatRequest):
 class UploadRequest(BaseModel):
     filename: str
     kind: str = "syllabus"  # syllabus | exam
+    syllabus_id: Optional[str] = None
     data: str = ""
     encoding: str = "text"  # text | base64
 
@@ -753,47 +809,87 @@ class LlmSettingsRequest(BaseModel):
 
 @app.get("/api/sources")
 async def list_sources():
-    """List the raw syllabus/exam files currently on disk."""
+    """List the raw syllabus/exam files on disk, tagged with their syllabus.
+
+    Files uploaded into a syllabus container (``syllabi/<id>/`` or
+    ``exams/<id>/``) are tagged with that id; loose legacy documents are tagged
+    with the syllabus they were linked to at last sync.
+    """
+    reg = library.load_registry()
+    exam_sid = {eid: e.get("syllabus_id") for eid, e in reg.get("exams", {}).items()}
     out: List[Dict] = []
     for kind, d in (("syllabus", SYLLABI_DIR), ("exam", EXAMS_DIR)):
-        if not d.exists():
-            continue
-        for p in sorted(d.iterdir()):
-            if not p.is_file() or p.suffix.lower() not in library.SOURCE_EXTENSIONS:
-                continue
+        for s in library._scan(d, kind):
+            rel = s["rel"]
+            sid = s.get("syllabus_id")
+            if not sid:
+                info = reg.get("sources", {}).get(rel, {})
+                sid = info.get("syllabus_id") if kind == "syllabus" \
+                    else exam_sid.get(info.get("exam_id"))
             out.append({
-                "name": p.name,
-                "rel": str(p.relative_to(library.CW_HOME)),
+                "name": s["name"],
+                "rel": rel,
                 "kind": kind,
-                "size": p.stat().st_size,
-                "mtime": p.stat().st_mtime,
+                "size": s["path"].stat().st_size,
+                "mtime": s["mtime"],
+                "syllabus_id": sid or None,
             })
     return out
 
 
 @app.post("/api/upload")
 async def upload(req: UploadRequest):
-    """Write an uploaded document into the syllabus/exam folder and re-sync."""
+    """Write an uploaded document and re-sync.
+
+    When ``syllabus_id`` is given the file is stored inside that syllabus's
+    container (``syllabi/<id>/…`` or ``exams/<id>/…``) so it is attached to it
+    deterministically. Without it, legacy loose-document uploads keep working.
+    """
     if req.kind not in ("syllabus", "exam"):
         raise HTTPException(status_code=400, detail="kind must be 'syllabus' or 'exam'")
     name = Path(req.filename).name
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="Invalid filename")
-    dest_dir = SYLLABI_DIR if req.kind == "syllabus" else EXAMS_DIR
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / name
     try:
         content = base64.b64decode(req.data) if req.encoding == "base64" else req.data.encode("utf-8")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Could not decode content: {e}") from e
+
+    slug = None
+    if req.syllabus_id:
+        slug = library._slugify(req.syllabus_id) or req.syllabus_id
+        # The syllabus container must exist so the created syllabus stays
+        # visible (project.json) and its future exams have a home.
+        sdir = SYLLABI_DIR / slug
+        sdir.mkdir(parents=True, exist_ok=True)
+        (EXAMS_DIR / slug).mkdir(parents=True, exist_ok=True)
+        if req.kind == "syllabus":
+            proj = sdir / "project.json"
+            if not proj.exists():
+                reg = library.load_registry()
+                s = reg.get("syllabi", {}).get(slug) or {}
+                proj.write_text(json.dumps({
+                    "id": slug,
+                    "name": s.get("name") or slug,
+                    "language": s.get("language") or "auto",
+                    "discipline": None,
+                    "created": datetime.now().isoformat(timespec="seconds"),
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    dest_dir = SYLLABI_DIR if req.kind == "syllabus" else EXAMS_DIR
+    if slug:
+        dest_dir = dest_dir / slug
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / name
     dest.write_bytes(content)
     summary = await asyncio.to_thread(library.sync_library)
-    return {"status": "ok", "saved": name, "summary": summary}
+    return {"status": "ok", "saved": name,
+            "syllabus_id": slug or None, "summary": summary}
 
 
 @app.delete("/api/syllabi/{syllabus_id}")
 async def delete_syllabus(syllabus_id: str):
-    """Remove a syllabus, its source files, generated artifacts and progress."""
+    """Remove a syllabus: its container folders, source files, artifacts, progress."""
     reg = library.load_registry()
     removed: List[str] = []
     for rel, info in list(reg.get("sources", {}).items()):
@@ -802,6 +898,12 @@ async def delete_syllabus(syllabus_id: str):
             if p.exists():
                 p.unlink()
                 removed.append(rel)
+    for d in (SYLLABI_DIR / syllabus_id, EXAMS_DIR / syllabus_id):
+        if d.exists():
+            for f in sorted(d.rglob("*")):
+                if f.is_file():
+                    removed.append(str(f.relative_to(library.CW_HOME)))
+            shutil.rmtree(d)
     for p in (SYLLABI_DIR / f"{syllabus_id}.json",
               CHEATSHEETS_DIR / f"{syllabus_id}_cheatsheet.md",
               EXAMS_DIR / f"{syllabus_id}_mock.json"):

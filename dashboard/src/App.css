@@ -410,6 +410,10 @@ button.quest-item.clickable:hover { border-color: var(--brand); background: #eef
 .quest-layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr); gap: 1.2rem; align-items: start; }
 .chat-panel { display: flex; flex-direction: column; height: calc(100vh - 150px); min-height: 480px; }
 .chat-head { display: flex; align-items: center; gap: 0.8rem; padding-bottom: 0.8rem; border-bottom: 1px solid var(--line); }
+.quest-worlds { display: flex; align-items: center; flex-wrap: wrap; gap: 0.45rem; padding: 0.65rem 0; border-bottom: 1px solid var(--line); }
+.quest-worlds-label { font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-right: 0.3rem; }
+.quest-worlds button.chip.chip-active { background: var(--brand); color: #fff; border-color: var(--brand); }
+.quest-worlds .chip { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mascot { font-size: 2.4rem; }
 .chat-head h2 { font-size: 1.2rem; }
 
@@ -688,3 +692,18 @@ button.quest-item.clickable:hover { border-color: var(--brand); background: #eef
   .branch-name { flex-basis: 110px; }
   .msg { max-width: 94%; }
 }
+
+/* ---------------------------------------------------------------- settings — syllabus-first flow */
+
+.settings-flow { align-items: start; }
+.settings-flow .exam-item { flex-wrap: wrap; gap: 0.4rem; }
+.settings-flow .exam-item .btn.small { padding: 0.25rem 0.6rem; font-size: 0.72rem; white-space: nowrap; }
+.new-syllabus {
+  display: flex; flex-direction: column; gap: 0.55rem; margin-top: 0.8rem;
+  padding: 0.8rem; border: 1px dashed var(--line); border-radius: var(--radius); background: #f8fafd;
+}
+.new-syllabus input,
+.new-syllabus select { padding: 0.45rem 0.6rem; border: 1px solid var(--line); border-radius: 8px; font: inherit; color: var(--ink); background: #fff; }
+.row-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.file-btn { cursor: pointer; text-align: center; }
+.upload-row .muted { font-size: 0.8rem; }

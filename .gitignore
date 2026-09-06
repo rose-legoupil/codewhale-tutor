@@ -4,6 +4,7 @@ __pycache__/
 .codewhale/
 node_modules/
 dist/
+.venv/*
 
 brevet/*
 L2-Miash/*
