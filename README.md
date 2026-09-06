@@ -41,6 +41,7 @@ A [codewhale](https://codewhale.net/en) set up designed for students to benefit 
 
 ### Document conventions
 
+
 - By default a syllabus's `id` is its filename stem. Two files merge into one
   syllabus when they share an `id`.
 - Optional front matter at the top of a Markdown file overrides the defaults and
